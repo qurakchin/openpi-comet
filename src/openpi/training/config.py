@@ -510,12 +510,6 @@ class TrainConfig:
     # A weight loader can optionally load (possibly partial) weights from disk after the model is initialized.
     weight_loader: weight_loaders.WeightLoader = dataclasses.field(default_factory=weight_loaders.NoOpWeightLoader)
 
-    # Optional path to a PyTorch checkpoint to load weights from.
-    pytorch_weight_path: str | None = None
-
-    # Precision for PyTorch training.
-    pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
-
     # Learning rate schedule to use for training.
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
 
@@ -585,6 +579,18 @@ class TrainConfig:
     # Optionally, repo_id for validation set (if different from train)
     val_repo_id: str | None = None
     val_episodes_index: list[int] | None = None
+
+    # Optional path to a PyTorch checkpoint to load weights from.
+    pytorch_weight_path: str | None = None
+
+    # Precision for PyTorch training.
+    pytorch_training_precision: Literal["bfloat16", "float32", "mp_bfloat16"] = "mp_bfloat16"
+
+    # Distribution method for PyTorch training.
+    pytorch_dist_method: Literal[None, "ddp", "fsdp1", "fsdp2"] = "fsdp1"
+
+    # Distribution arguments for PyTorch training.
+    pytorch_dist_args: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
     def assets_dirs(self) -> pathlib.Path:

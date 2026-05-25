@@ -132,6 +132,16 @@ def init_train_state(
     return train_state, state_sharding
 
 
+def build_datasets(config: _config.TrainConfig, sharding):
+    data_loader = _data_loader.create_behavior_data_loader(
+        config,
+        skip_norm_stats=False,
+        sharding=sharding,
+        shuffle=False,
+    )
+    return data_loader
+
+
 @at.typecheck
 def train_step(
     config: _config.TrainConfig,
@@ -225,19 +235,16 @@ def main(config: _config.TrainConfig):
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
-    data_loader = _data_loader.create_behavior_data_loader(
-        config, sharding=data_sharding, shuffle=True, skip_norm_stats=False
-    )
-    data_iter = iter(data_loader)
-    batch = next(data_iter)
-    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    data_loader = build_datasets(config, sharding=data_sharding)
 
     train_state, train_state_sharding = init_train_state(config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
+    start_step = 0
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        start_step = int(train_state.step)
 
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
@@ -246,7 +253,6 @@ def main(config: _config.TrainConfig):
         donate_argnums=(1,),
     )
 
-    start_step = int(train_state.step)
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -256,6 +262,7 @@ def main(config: _config.TrainConfig):
 
     infos = []
     for step in pbar:
+        batch = next(data_iter)
         with sharding.set_mesh(mesh):
             train_state, info = ptrain_step(train_rng, train_state, batch)
         infos.append(info)
@@ -266,9 +273,12 @@ def main(config: _config.TrainConfig):
             pbar.write(f"Step {step}: {info_str}")
             wandb.log(reduced_info, step=step)
             infos = []
-        batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        should_save = (
+            (global_step % config.save_interval == 0 and global_step > start_step)
+            or global_step == config.num_train_steps - 1
+        )
+        if should_save:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")

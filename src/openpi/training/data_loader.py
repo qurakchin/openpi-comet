@@ -220,10 +220,9 @@ def transform_iterable_dataset(
 def create_behavior_data_loader(
     config: _config.TrainConfig,
     *,
-    sharding: jax.sharding.Sharding | None = None,
     shuffle: bool = False,
-    num_batches: int | None = None,
     skip_norm_stats: bool = False,
+    sharding: jax.sharding.Sharding | None = None,
     seed_shift: int = 0,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     if isinstance(config.data, list):
@@ -240,41 +239,32 @@ def create_behavior_data_loader(
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
+    if sharding is None:
+        # Use data parallel sharding by default for JAX only.
+        sharding = jax.sharding.NamedSharding(
+            jax.sharding.Mesh(jax.devices(), ("B",)),
+            jax.sharding.PartitionSpec("B"),
+        )
+    local_batch_size = config.batch_size // jax.process_count()
     data_loader = TorchDataLoader(
         dataset,
-        local_batch_size=config.batch_size // jax.process_count(),
-        sharding=sharding,
+        local_batch_size=local_batch_size,
         shuffle=shuffle,
-        num_batches=num_batches,
         num_workers=config.num_workers,
         seed=config.seed + seed_shift,
+        framework="jax",
+        sharding=sharding,
     )
 
     return DataLoaderImpl(data_config, data_loader)
 
 
-def create_torch_behavior_data_loader(
+def create_behavior_data_loader_torch(
     config: _config.TrainConfig,
-    action_horizon: int,
-    batch_size: int,
     *,
-    skip_norm_stats: bool = False,
     shuffle: bool = False,
-    num_workers: int = 0,
-    seed: int = 0,
+    skip_norm_stats: bool = False,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
-    """Create a data loader for training.
-
-    Args:
-        data_config: The data configuration.
-        action_horizon: The action horizon.
-        batch_size: The batch size.
-        skip_norm_stats: Whether to skip data normalization.
-        shuffle: Whether to shuffle the data.
-        num_workers: The number of worker processes to use. If zero, the data loader will
-            execute in the main process.
-        seed: The seed to use for shuffling the data.
-    """
     if isinstance(config.data, list):
         data_configs = [config_.create(config.assets_dirs, config.model) for config_ in config.data]
         dataset = create_multi_behavior_dataset(
@@ -298,20 +288,20 @@ def create_torch_behavior_data_loader(
             shuffle=shuffle,
             drop_last=True,
         )
-        local_batch_size = batch_size // torch.distributed.get_world_size()
+        local_batch_size = config.batch_size // torch.distributed.get_world_size()
+        shuffle = True # do shuffle in sampler
     else:
-        local_batch_size = batch_size
+        local_batch_size = config.batch_size
 
     logging.info(f"local_batch_size: {local_batch_size}")
     data_loader = TorchDataLoader(
         dataset,
         local_batch_size=local_batch_size,
-        sharding=None,
-        shuffle=(sampler is None and shuffle),  # Don't shuffle if using sampler
-        sampler=sampler,
-        num_workers=num_workers,
-        seed=seed,
+        shuffle=shuffle,
+        num_workers=config.num_workers,
+        seed=config.seed,
         framework="pytorch",
+        sampler=sampler,
     )
 
     return DataLoaderImpl(data_config, data_loader)
@@ -325,13 +315,14 @@ class TorchDataLoader:
         dataset,
         local_batch_size: int,
         *,
-        sharding: jax.sharding.Sharding | None = None,
         shuffle: bool = False,
-        sampler: torch.utils.data.Sampler | None = None,
-        num_batches: int | None = None,
         num_workers: int = 0,
         seed: int = 0,
         framework: str = "jax",
+        # jax
+        sharding: jax.sharding.Sharding | None = None,
+        # pytorch
+        sampler: torch.utils.data.Sampler | None = None,
     ):
         """Create a PyTorch data loader.
 
@@ -340,17 +331,14 @@ class TorchDataLoader:
             local_batch_size: The local batch size for each process.
             sharding: The sharding to use for the data loader.
             shuffle: Whether to shuffle the data.
-            num_batches: If provided, determines the number of returned batches. If the
-                number is larger than the number of batches in the dataset, the data loader
-                will loop over the dataset. If not provided, will iterate over the dataset
-                indefinitely.
             num_workers: The number of worker processes to use. If zero, the data loader will
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
         from behavior.learning.datas.dataset import MultiBehaviorLeRobotDataset
 
-        if jax.process_count() > 1:
+        self.framework = framework
+        if framework == "jax" and jax.process_count() > 1:
             logging.info(f"Subsetting dataset for process {jax.process_index()}.")
             if isinstance(dataset._dataset, MultiBehaviorLeRobotDataset):
                 for dataset_index in range(len(dataset._dataset.datasets)):
@@ -380,21 +368,18 @@ class TorchDataLoader:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
 
         # Store sharding - None for PyTorch, JAX sharding for JAX
+        if framework == "jax":
+            assert sharding is not None
         self._sharding = sharding
-        if sharding is None and framework == "jax":
-            # Use data parallel sharding by default for JAX only.
-            self._sharding = jax.sharding.NamedSharding(
-                jax.sharding.Mesh(jax.devices(), ("B",)),
-                jax.sharding.PartitionSpec("B"),
-            )
-        self._num_batches = num_batches
 
         mp_context = None
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
 
         # For multi-process JAX training, each process should have a different seed
-        process_seed = seed + jax.process_index()
+        process_seed = seed
+        if framework == "jax":
+            process_seed += jax.process_index()
         generator = torch.Generator()
         generator.manual_seed(process_seed)
         self._data_loader = torch.utils.data.DataLoader(
@@ -420,8 +405,6 @@ class TorchDataLoader:
         while True:
             data_iter = iter(self._data_loader)
             while True:
-                if self._num_batches is not None and num_items >= self._num_batches:
-                    return
                 try:
                     batch = next(data_iter)
                 except StopIteration as e:
@@ -429,7 +412,7 @@ class TorchDataLoader:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
-                if self._sharding is not None:
+                if self.framework == "jax":
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
                 else:
                     yield jax.tree.map(torch.as_tensor, batch)
