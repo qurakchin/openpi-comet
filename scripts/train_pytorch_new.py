@@ -184,7 +184,6 @@ def apply_fsdp2(model, world_size: int, device, mp_policy, use_noreshard):
     mesh = init_device_mesh("cuda", (world_size,))
     reshard_after_forward = not use_noreshard
     fully_shard(model, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
-    logging.info(f"Applied FSDP2 with per-layer sharding")
     return model
 
 
@@ -314,7 +313,8 @@ def init_model(
 
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
-        logging.info("Enabled gradient checkpointing")
+        if is_main:
+            logging.info("Enabled gradient checkpointing")
 
     # Load weights
     if config.pytorch_weight_path is not None:
@@ -325,29 +325,32 @@ def init_model(
         if config.pytorch_dist_args.get("load_old_ckpt_fmt", False):
             state_dict = ckpt_fmt.old_to_new_state_dict(state_dict)
         model.load_state_dict(state_dict, strict=True)
-        logging.info(f"Loaded weights from {model_path}")
+        if is_main:
+            logging.info(f"Loaded weights from {model_path}")
 
     if model_load_dtype == "float32":
         model.to(dtype=torch.float32)
-        logging.info("Converted all params to float32")
+        if is_main:
+            logging.info("Converted all params to float32")
     elif model_load_dtype == "bfloat16":
         model.to(dtype=torch.bfloat16)
-        logging.info("Converted all params to bfloat16")
+        if is_main:
+            logging.info("Converted all params to bfloat16")
     else:
         assert False
 
-    compile_before, compile_after = False, False
+    compile_position = None
     if compile_mode is not None:
         if dist_method not in ["fsdp1"]:
-            compile_before = True
+            compile_position = "before"
         else:
-            compile_after = True
+            compile_position = "after"
+        assert compile_position in ["before", "after"]
 
-    if compile_before:
+    if compile_position == "before":
         model = torch.compile(model, mode=compile_mode, dynamic=False)
-        logging.info(
-            f"Enable torch.compile(mode={compile_mode}) BEFORE"
-        )
+        if is_main:
+            logging.info(f"Enable torch.compile(mode={compile_mode}) BEFORE")
 
     if dist_method == "ddp":
         model = apply_ddp(model, world_size, device)
@@ -362,24 +365,26 @@ def init_model(
         if is_main:
             logging.info(f"Enabled FSDP2 with fully_shard, use_noreshard={use_noreshard}")
 
-    if compile_after:
+    if compile_position == "after":
         model = torch.compile(model, mode=compile_mode, dynamic=False)
-        logging.info(
-            f"Enable torch.compile(mode={compile_mode}) After"
-        )
+        if is_main:
+            logging.info(f"Enable torch.compile(mode={compile_mode}) After")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
     decay_steps = config.lr_schedule.decay_steps
     end_lr = config.lr_schedule.decay_lr
-    optim = torch.optim.AdamW(
-        model.parameters(),
+    optim_kwargs = dict(
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
         fused=True,
+    )
+    optim = torch.optim.AdamW(
+        model.parameters(),
+        **optim_kwargs,
     )
 
     if is_main:
@@ -553,7 +558,7 @@ def save_checkpoint(dist_method, model, optimizer, global_step, config: _config.
         dist.barrier()
 
 
-def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device):
+def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device, is_main):
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
@@ -566,7 +571,8 @@ def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device):
     latest_step = max(checkpoint_steps)
     ckpt_dir = checkpoint_dir / f"{latest_step}"
 
-    logging.info("Loading model state...")
+    if is_main:
+        logging.info("Loading model state...")
     safetensors_path = ckpt_dir / "model.safetensors"
     torch_model_path = ckpt_dir / "model.pt"
 
@@ -592,7 +598,8 @@ def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device):
 
     torch.cuda.empty_cache()
     gc.collect()
-    log_memory_usage(device, latest_step, "after_loading_model")
+    if is_main:
+        log_memory_usage(device, latest_step, "after_loading_model")
 
     logging.info("Loading optimizer state...")
     optimizer_path = ckpt_dir / "optimizer.pt"
@@ -622,7 +629,8 @@ def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device):
     del optimizer_state_dict
     torch.cuda.empty_cache()
     gc.collect()
-    log_memory_usage(device, latest_step, "after_loading_optimizer")
+    if is_main:
+        log_memory_usage(device, latest_step, "after_loading_optimizer")
 
     # Load metadata
     logging.info("Loading metadata...")
@@ -631,9 +639,10 @@ def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device):
     del metadata
     torch.cuda.empty_cache()
     gc.collect()
-    log_memory_usage(device, latest_step, "after_loading_metadata")
+    if is_main:
+        log_memory_usage(device, latest_step, "after_loading_metadata")
 
-    logging.info(f"Successfully loaded all checkpoint components from step {latest_step}")
+        logging.info(f"Successfully loaded all checkpoint components from step {latest_step}")
     return global_step
 
 
@@ -715,11 +724,6 @@ def main(config: _config.TrainConfig):
             "use_autocast", False
         )
 
-    init_logging()
-    logging.info(f"Running on: {platform.node()}")
-    logging.info(f"PT global device count: {torch.cuda.device_count()}")
-    logging.info(f"Dist method: {dist_method}")
-
     if config.batch_size % torch.cuda.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {torch.cuda.device_count()}."
@@ -728,12 +732,19 @@ def main(config: _config.TrainConfig):
     world_size, local_rank, is_main, device = setup_distributed(dist_method)
     set_seed(config.seed, local_rank)
 
+    if is_main:
+        init_logging()
+        logging.info(f"Running on: {platform.node()}")
+        logging.info(f"PT global device count: {torch.cuda.device_count()}")
+        logging.info(f"Dist method: {dist_method}")
+
     if True:
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
-        logging.info("Enabled cudnn benchmark and TF32 optimizations")
+        if is_main:
+            logging.info("Enabled cudnn benchmark and TF32 optimizations")
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -743,30 +754,36 @@ def main(config: _config.TrainConfig):
             latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
             if latest_step is not None:
                 resuming = True
-                logging.info(
-                    f"Resuming from experiment checkpoint directory: {exp_checkpoint_dir} at step {latest_step}"
-                )
+                if is_main:
+                    logging.info(
+                        f"Resuming from experiment checkpoint directory: {exp_checkpoint_dir} at step {latest_step}"
+                    )
             else:
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
     # Create checkpoint directory with experiment name
     if not resuming:
         config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            logging.info(f"Created checkpoint directory: {config.checkpoint_dir}")
     else:
-        logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
+        if is_main:
+            logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
-    init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+    if is_main:
+        init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
 
     effective_batch_size = config.batch_size // world_size
-    logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
-    )
+    if is_main:
+        logging.info(
+            f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
+        )
 
     data_loader = build_datasets(config)
     data_config = data_loader.data_config()
@@ -790,8 +807,9 @@ def main(config: _config.TrainConfig):
     # Load checkpoint if resuming
     start_step = 0
     if resuming:
-        start_step = load_checkpoint(dist_method, model, optim, config.checkpoint_dir, device)
-        logging.info(f"Resumed training from step {start_step}")
+        start_step = load_checkpoint(dist_method, model, optim, config.checkpoint_dir, device, is_main)
+        if is_main:
+            logging.info(f"Resumed training from step {start_step}")
 
     model.train()
 
@@ -870,10 +888,11 @@ def main(config: _config.TrainConfig):
             reduced_info = jax.tree.map(np.mean, stacked_infos)
             reduced_info = {k: reduced_info[k] for k in sorted(reduced_info.keys())}
             info_str = ", ".join(f"{k}={v}" for k, v in reduced_info.items()) + f", step_time={step_time:.2f}s"
-            pbar.write(f"Step {global_step}: {info_str}")
-            pbar.set_postfix(reduced_info)
+            if is_main:
+                pbar.write(f"Step {global_step}: {info_str}")
+                pbar.set_postfix(reduced_info)
 
-            if config.wandb_enabled:
+            if is_main and config.wandb_enabled:
                 wandb.log(reduced_info, step=global_step)
             infos = []
 
@@ -887,7 +906,8 @@ def main(config: _config.TrainConfig):
     time_now = time.time()
     time_all = time_now - pbar.start_t
     time_step = time_all / (config.num_train_steps - start_step)
-    pbar.write(f"All time: {time_all}, Step time: {time_step}")
+    if is_main:
+        pbar.write(f"All time: {time_all}, Step time: {time_step}")
     pbar.close()
 
     # Finish wandb run
