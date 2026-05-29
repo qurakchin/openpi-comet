@@ -276,7 +276,6 @@ class Attention(nn.Module):
 
         # Apply RoPE
         q = _apply_rope(q, positions=positions)
-        q = q * (self.head_dim**-0.5)
         k = _apply_rope(k, positions=positions)
 
         # KV cache: concatenate along sequence dim
@@ -287,7 +286,13 @@ class Attention(nn.Module):
 
         new_kv_cache = (k, v)
 
+        # Apply mask: shape (B, 1, T, S) -> broadcast to (B, K, G, T, S)
+        if attn_mask.dim() == 4:
+            attn_mask = attn_mask[:, 0:1, :, :]  # (B, 1, T, S)
+
         # GQA einsum pattern matching JAX:
+        q = q * (self.head_dim**-0.5)
+
         # q: (B, T, num_heads, H) -> rearrange to (B, T, K, G, H)
         # k: (B, S, num_kv_heads, H) -> stays (B, S, K, H)
         K = self.num_kv_heads
@@ -300,13 +305,9 @@ class Attention(nn.Module):
         # einsum "BTKGH,BSKH->BKGTS"
         logits = torch.einsum("BTKGH,BSKH->BKGTS", q_r.float(), k_r.float())
 
-        # Apply mask: shape (B, 1, T, S) -> broadcast to (B, K, G, T, S)
-        big_neg = -2.3819763e38
-        if attn_mask.dim() == 4:
-            attn_mask = attn_mask[:, 0:1, :, :]  # (B, 1, T, S)
-
         # Align mask to logits shape: logits is (B, K, G, T, S), mask is (B, 1, T, S)
         # We need mask to be (B, 1, 1, T, S) so it broadcasts to (B, K, G, T, S)
+        big_neg = -2.3819763e38
         mask_for_logits = attn_mask[:, :, None, :, :].expand_as(logits).bool()
         masked_logits = torch.where(
             mask_for_logits,

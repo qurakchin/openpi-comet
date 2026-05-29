@@ -17,18 +17,23 @@ import safetensors.torch
 import torch
 import torch.distributed as dist
 from torch._dynamo import OptimizedModule
+# FSDP1
 from torch.distributed.fsdp import (
     BackwardPrefetch,
     FullOptimStateDictConfig,
     FullStateDictConfig,
-    FullyShardedDataParallel as FSDP,
+    FullyShardedDataParallel as FSDP1,
     ShardingStrategy,
     StateDictType,
 )
+# FSDP2
 from torch.distributed._composable.fsdp import fully_shard
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import FSDPModule, MixedPrecisionPolicy
+from torch.distributed.fsdp import (
+    FSDPModule as FSDP2,
+    MixedPrecisionPolicy,
+)
 import tqdm
 import wandb
 from openpi.models.pi0_config import Pi0Config as Pi0Config_old
@@ -89,7 +94,7 @@ def setup_distributed(dist_method):
         s.close()
         return port
 
-    if dist_method == "none":
+    if dist_method == "no_dist":
         device = torch.device("cuda:0")
         torch.cuda.set_device(0)
         return 1, 0, True, device
@@ -133,7 +138,7 @@ def get_base_model(dist_method, model):
     if hasattr(model, '_orig_mod'):
         # torch._dynamo
         model = model._orig_mod
-    if dist_method == "none":
+    if dist_method == "no_dist":
         return model
     elif dist_method in ("ddp", "fsdp1"):
         return model.module
@@ -162,7 +167,7 @@ def apply_fsdp1(model, device, mixed_precision, use_prefetch):
         backward_prefetch = None
         forward_prefetch = False
 
-    return FSDP(
+    return FSDP1(
         model,
         auto_wrap_policy=auto_wrap_policy,
         sharding_strategy=ShardingStrategy.FULL_SHARD,
@@ -195,10 +200,12 @@ def clip_grad_norm_fsdp2(parameters, max_norm: float, device):
 
     total_sq = torch.zeros((), device=device, dtype=torch.float32)
     for grad in grads:
-        local_grad = grad.to_local() if hasattr(grad, "to_local") else grad
-        total_sq += local_grad.detach().float().pow(2).sum()
-    if dist.is_initialized():
-        dist.all_reduce(total_sq, op=dist.ReduceOp.SUM)
+        if hasattr(grad, "to_local"):
+            local_grad = grad.to_local().detach().float().pow(2).sum().cuda()
+            dist.all_reduce(local_grad, op=dist.ReduceOp.SUM)
+        else:
+            local_grad = grad.detach().float().pow(2).sum().cuda()
+        total_sq += local_grad
 
     total_norm = total_sq.sqrt()
     clip_coef = max_norm / (total_norm.item() + 1e-6)
@@ -229,10 +236,10 @@ def calc_param_norm(named_parameters, device):
         if any(x in name for x in ("bias", "scale", "pos_embedding", "embed_tokens", "embedding")):
             continue
         if hasattr(param, "to_local"):
-            local_sq = param.to_local().detach().float().pow(2).sum()
+            local_sq = param.to_local().detach().float().pow(2).sum().cuda()
             dist.all_reduce(local_sq, op=dist.ReduceOp.SUM)
         else:
-            local_sq = param.detach().float().pow(2).sum()
+            local_sq = param.detach().float().pow(2).sum().cuda()
         total_sq += local_sq
     return total_sq.sqrt()
 
@@ -252,24 +259,23 @@ def calc_param_std_dict(model, device):
         "llm": "PaliGemma.llm",
         "img": "PaliGemma.img",
     }
-    std_dict = {key: torch.zeros((), device=device, dtype=torch.float32) for key in set(merge_keys.values())}
+    std_dict = {key: 0.0 for key in set(merge_keys.values())}
 
     for k, param in model.named_parameters():
         if hasattr(param, "to_local"):
-            std = param.to_local().detach().float().pow(2).sum()
+            std = param.to_local().detach().float().pow(2).sum().cuda()
             dist.all_reduce(std, op=dist.ReduceOp.SUM)
         else:
             std = param.detach().float().pow(2).sum()
 
         for merge_k, merge_v in merge_keys.items():
             if merge_k in k:
-                std_dict[merge_v] += std
+                std_dict[merge_v] += std.item()
                 break
         else:
-            std_dict[k] = std
+            std_dict[k] = std.item()
 
-    param_std_dict = {k: v.item() for k, v in std_dict.items()}
-    return param_std_dict
+    return std_dict
 
 def init_model(
     config: _config.TrainConfig,
@@ -284,7 +290,7 @@ def init_model(
     mp_policy = None
     if model_load_dtype == "mp_bfloat16":
         model_load_dtype = "float32"
-        if dist_method in ["none", "ddp"]:
+        if dist_method in ["no_dist", "ddp"]:
             assert use_autocast == True
         elif dist_method == "fsdp1":
             if not use_autocast:
@@ -341,7 +347,7 @@ def init_model(
 
     compile_position = None
     if compile_mode is not None:
-        if dist_method not in ["fsdp1"]:
+        if dist_method not in ["fsdp1", "fsdp2"]:
             compile_position = "before"
         else:
             compile_position = "after"
@@ -426,7 +432,6 @@ def train_step(
     batch,
     use_autocast,
 ):
-    observation, actions = batch
     def lr_schedule(step: int):
         warmup_steps = config.lr_schedule.warmup_steps
         peak_lr = config.lr_schedule.peak_lr
@@ -442,12 +447,13 @@ def train_step(
         cos = 0.5 * (1 + np.cos(np.pi * progress))
         return end_lr + (peak_lr - end_lr) * cos
 
-    observation = _move_to_device(observation, device)
-    actions = actions.to(device=device)
-
     # Update LR
     for pg in optim.param_groups:
         pg["lr"] = lr_schedule(global_step)
+
+    observation, actions = batch
+    observation = _move_to_device(observation, device)
+    actions = actions.to(device=device)
 
     # Forward pass
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
@@ -459,8 +465,11 @@ def train_step(
     loss = losses.mean()
     loss.backward()
 
+    loss_acc = loss.cuda()
+    dist.all_reduce(loss_acc, op=dist.ReduceOp.AVG)
+
     # Gradient clipping
-    if dist_method in ["none", "ddp"]:
+    if dist_method in ["no_dist", "ddp"]:
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
     elif dist_method == "fsdp1":
         grad_norm = model.clip_grad_norm_(max_norm=config.optimizer.clip_gradient_norm)
@@ -476,7 +485,7 @@ def train_step(
     trainable_params = {k: v for k, v in model.named_parameters() if v.requires_grad}
     param_norm = calc_param_norm(trainable_params, device)
     info = {
-        "loss": loss.item(),
+        "loss": loss_acc.item(),
         "learning_rate": optim.param_groups[0]["lr"],
         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
         "param_norm": float(param_norm),
@@ -502,14 +511,13 @@ def save_checkpoint(dist_method, model, optimizer, global_step, config: _config.
     if dist.is_initialized():
         dist.barrier()
 
-    if dist_method in ["none", "ddp"]:
+    # model.state_dict() returns master params (if wrapper) or normal state dict
+    if dist_method in ["no_dist", "ddp"]:
         if is_main:
             base = get_base_model(dist_method, model)
             state_dict = base.state_dict()
             # Clone tied weights (embed_tokens/lm_head share storage) for safetensors compat
             for k in list(state_dict.keys()):
-                if state_dict[k].untyped_storage().size() != state_dict[k].untyped_storage().size():
-                    continue
                 for k2 in state_dict:
                     if k2 != k and state_dict[k].untyped_storage().data_ptr() == state_dict[k2].untyped_storage().data_ptr():
                         state_dict[k] = state_dict[k].clone()
@@ -518,9 +526,9 @@ def save_checkpoint(dist_method, model, optimizer, global_step, config: _config.
     elif dist_method == "fsdp1":
         state_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         optim_config = FullOptimStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, state_config, optim_config):
+        with FSDP1.state_dict_type(model, StateDictType.FULL_STATE_DICT, state_config, optim_config):
             model_state = model.state_dict()
-            optimizer_state = FSDP.optim_state_dict(model, optimizer)
+            optimizer_state = FSDP1.optim_state_dict(model, optimizer)
         if is_main:
             torch.save(model_state, tmp_ckpt_dir / "model.pt")
             torch.save(optimizer_state, tmp_ckpt_dir / "optimizer.pt")
@@ -577,7 +585,7 @@ def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device, is_ma
     torch_model_path = ckpt_dir / "model.pt"
 
     loaded = False
-    if dist_method == "none":
+    if dist_method == "no_dist":
         if safetensors_path.exists():
             safetensors.torch.load_model(get_base_model(dist_method, model), safetensors_path, device=str(device))
             model_state_dict = None
@@ -608,10 +616,10 @@ def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device, is_ma
     else:
         raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
 
-    if dist_method in ["none", "ddp"]:
+    if dist_method in ["no_dist", "ddp"]:
         optimizer.load_state_dict(optimizer_state_dict)
     elif dist_method == "fsdp1":
-        optimizer_state_dict = FSDP.optim_state_dict_to_load(model, optimizer, optimizer_state_dict)
+        optimizer_state_dict = FSDP1.optim_state_dict_to_load(model, optimizer, optimizer_state_dict)
         optimizer.load_state_dict(optimizer_state_dict)
     elif dist_method == "fsdp2":
         state_options = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -706,8 +714,8 @@ def main(config: _config.TrainConfig):
     dist_method = os.environ.get("DIST_METHOD", "")
     if dist_method == "":
         dist_method = config.pytorch_dist_method
-    assert dist_method in ["none", "ddp", "fsdp1", "fsdp2"]
-    if dist_method == "none":
+    assert dist_method in ["no_dist", "ddp", "fsdp1", "fsdp2"]
+    if dist_method == "no_dist":
         assert os.environ.get("MASTER_ADDR", None) is None
 
     compile_mode = os.environ.get("TORCH_COMPILE_MODE", "default")
@@ -800,9 +808,9 @@ def main(config: _config.TrainConfig):
     )
     if dist_method == "fsdp1":
         _m = model._orig_mod if isinstance(model, OptimizedModule) else model
-        assert isinstance(_m, FSDP)
+        assert isinstance(_m, FSDP1)
     elif dist_method == "fsdp2":
-        assert isinstance(model, FSDPModule)
+        assert isinstance(_m, FSDP2)
 
     # Load checkpoint if resuming
     start_step = 0
@@ -814,27 +822,27 @@ def main(config: _config.TrainConfig):
     model.train()
 
     # CUDA graph warmup:
-    if compile_mode is not None:
-        WARMUP_STEPS = 3
-        if is_main:
-            logging.info(f"Running warmup ({WARMUP_STEPS} steps)...")
-        warmup_loader = debug_data_loader(effective_batch_size)
-        warmup_iter = itertools.cycle(warmup_loader)
-        warmup_amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
-        for _ in range(WARMUP_STEPS):
-            observation, actions = next(warmup_iter)
-            observation = _move_to_device(observation, device)
-            actions = actions.to(device=device)
-            with warmup_amp_ctx:
-                losses = model(observation, actions, train=True)
-            if not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
-            loss = losses.mean()
-            loss.backward()
-            optim.zero_grad(set_to_none=True)
-        del observation, actions, losses, loss
-        if is_main:
-            logging.info("CUDA graph warmup complete.")
+    # if compile_mode is not None:
+    #     WARMUP_STEPS = 3
+    #     if is_main:
+    #         logging.info(f"Running warmup ({WARMUP_STEPS} steps)...")
+    #     warmup_loader = debug_data_loader(effective_batch_size)
+    #     warmup_iter = itertools.cycle(warmup_loader)
+    #     warmup_amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
+    #     for _ in range(WARMUP_STEPS):
+    #         observation, actions = next(warmup_iter)
+    #         observation = _move_to_device(observation, device)
+    #         actions = actions.to(device=device)
+    #         with warmup_amp_ctx:
+    #             losses = model(observation, actions, train=True)
+    #         if not isinstance(losses, torch.Tensor):
+    #             losses = torch.tensor(losses, device=device, dtype=torch.float32)
+    #         loss = losses.mean()
+    #         loss.backward()
+    #         optim.zero_grad(set_to_none=True)
+    #     del observation, actions, losses, loss
+    #     if is_main:
+    #         logging.info("CUDA graph warmup complete.")
 
     if is_main:
         log_memory_usage(device, 0, "after_model_init")
@@ -854,6 +862,7 @@ def main(config: _config.TrainConfig):
         logging.info(f"Initialized param_std_dict: {json.dumps(param_std_dict, indent=2)}")
         logging.info(f"Initialized param_norm: {sum(param_std_dict.values())**0.5}")
 
+    # [zcy] trainer loop
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,

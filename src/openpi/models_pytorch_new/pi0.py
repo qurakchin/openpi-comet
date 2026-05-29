@@ -155,9 +155,9 @@ class Pi0(model.BaseModel):
             input_mask: (B, S) mask of valid tokens
             ar_mask: (S,) autoregressive mask (all False for prefix)
         """
+        tokens = []
         input_mask = []
         ar_mask = []
-        tokens = []
 
         # Embed images through SigLIP
         for name in obs.images:

@@ -587,7 +587,7 @@ class TrainConfig:
     pytorch_training_precision: Literal["bfloat16", "float32", "mp_bfloat16"] = "mp_bfloat16"
 
     # Distribution method for PyTorch training.
-    pytorch_dist_method: Literal[None, "ddp", "fsdp1", "fsdp2"] = "fsdp1"
+    pytorch_dist_method: Literal["ddp", "fsdp1", "fsdp2", "no_dist"] = "fsdp1"
 
     # Distribution arguments for PyTorch training.
     pytorch_dist_args: dict[str, Any] = dataclasses.field(default_factory=dict)
