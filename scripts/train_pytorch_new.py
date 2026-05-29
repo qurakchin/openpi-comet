@@ -771,14 +771,14 @@ def main(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
         if is_main:
+            shutil.rmtree(config.checkpoint_dir)
             logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
 
     # Create checkpoint directory with experiment name
     if not resuming:
-        config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         if is_main:
+            config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             logging.info(f"Created checkpoint directory: {config.checkpoint_dir}")
     else:
         if is_main:
@@ -862,7 +862,6 @@ def main(config: _config.TrainConfig):
         logging.info(f"Initialized param_std_dict: {json.dumps(param_std_dict, indent=2)}")
         logging.info(f"Initialized param_norm: {sum(param_std_dict.values())**0.5}")
 
-    # [zcy] trainer loop
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
