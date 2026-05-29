@@ -429,7 +429,7 @@ def train_step(
     optim,
     device,
     global_step,
-    batch,
+    batches,
     use_autocast,
 ):
     def lr_schedule(step: int):
@@ -451,21 +451,24 @@ def train_step(
     for pg in optim.param_groups:
         pg["lr"] = lr_schedule(global_step)
 
-    observation, actions = batch
-    observation = _move_to_device(observation, device)
-    actions = actions.to(device=device)
+    loss_acc = []
+    for batch in batches:
+        observation, actions = batch
+        observation = _move_to_device(observation, device)
+        actions = actions.to(device=device)
 
-    # Forward pass
-    amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
-    with amp_ctx:
-        losses = model(observation, actions, train=True)
-    if not isinstance(losses, torch.Tensor):
-        losses = torch.tensor(losses, device=device, dtype=torch.float32)
+        # Forward pass
+        amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
+        with amp_ctx:
+            losses = model(observation, actions, train=True)
+        if not isinstance(losses, torch.Tensor):
+            losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-    loss = losses.mean()
-    loss.backward()
+        loss = losses.mean() / len(batches)
+        loss_acc.append(loss.detach())
+        loss.backward()
 
-    loss_acc = loss.cuda()
+    loss_acc = torch.stack(loss_acc).sum().cuda()
     dist.all_reduce(loss_acc, op=dist.ReduceOp.AVG)
 
     # Gradient clipping
@@ -876,7 +879,7 @@ def main(config: _config.TrainConfig):
         if hasattr(data_loader, "set_epoch"):
             data_loader.set_epoch(global_step // len(data_loader))
 
-        batch = next(data_iter)
+        batches = [next(data_iter) for _ in range(config.gradient_accumulate)]
         info = train_step(
             config,
             dist_method,
@@ -884,7 +887,7 @@ def main(config: _config.TrainConfig):
             optim,
             device,
             global_step,
-            batch,
+            batches,
             use_autocast=use_autocast,
         )
         infos.append(info)
