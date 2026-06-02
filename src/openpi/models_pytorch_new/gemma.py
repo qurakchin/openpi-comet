@@ -478,6 +478,10 @@ class Module(nn.Module):
         self.layers = nn.ModuleList(
             [Block(configs, adarms=self.adarms, dropout=dropout) for _ in range(configs[0].depth)]
         )
+        self.layers_ckpt = [
+            lambda *args: torch.utils.checkpoint.checkpoint(layer, *args, use_reentrant=False)
+            for layer in self.layers
+        ]
 
         self.final_norms = nn.ModuleList([RMSNorm(c.width, adaptive=self.adarms[i]) for i, c in enumerate(configs)])
 
@@ -529,20 +533,12 @@ class Module(nn.Module):
             layer_kv_caches = list(kv_cache) if isinstance(kv_cache, list | tuple) else [kv_cache] * len(self.layers)
 
         new_layer_kv_caches = []
-        for i, layer in enumerate(self.layers):
+        layers = self.layers
+        if self.gradient_checkpointing and self.training:
+            layers = self.layers_ckpt
+        for i, layer in enumerate(layers):
             layer_kv = layer_kv_caches[i] if i < len(layer_kv_caches) else None
-            if self.gradient_checkpointing and self.training:
-                xs, new_kv = torch.utils.checkpoint.checkpoint(
-                    layer,
-                    xs,
-                    layer_kv,
-                    positions,
-                    mask,
-                    adarms_cond,
-                    use_reentrant=False,
-                )
-            else:
-                xs, new_kv = layer(xs, layer_kv, positions, mask, adarms_cond)
+            xs, new_kv = layer(xs, layer_kv, positions, mask, adarms_cond)
             new_layer_kv_caches.append(new_kv)
 
         # Return the list of per-layer KV caches

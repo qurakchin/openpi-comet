@@ -1,6 +1,5 @@
 import dataclasses
 import gc
-import itertools
 import json
 import logging
 import os
@@ -346,7 +345,7 @@ def init_model(
         assert False
 
     compile_position = None
-    if compile_mode is not None:
+    if compile_mode != "null":
         if dist_method not in ["fsdp1", "fsdp2"]:
             compile_position = "before"
         else:
@@ -721,7 +720,7 @@ def main(config: _config.TrainConfig):
     if dist_method == "no_dist":
         assert os.environ.get("MASTER_ADDR", None) is None
 
-    compile_mode = os.environ.get("TORCH_COMPILE_MODE", "default")
+    compile_mode = os.environ.get("TORCH_COMPILE_MODE", "")
     if compile_mode == "":
         compile_mode = config.pytorch_dist_args.get(
             "torch_compile_mode", "default"
