@@ -91,19 +91,15 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         self.layers = nn.ModuleList([Encoder1DBlock(dim, num_heads, mlp_dim, dropout) for _ in range(depth)])
-        self.layers_ckpt = [
-            lambda *args: torch.utils.checkpoint.checkpoint(layer, *args, use_reentrant=False)
-            for layer in self.layers
-        ]
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.gradient_checkpointing = use_gradient_checkpointing
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        layers = self.layers
-        if self.gradient_checkpointing and self.training:
-            layers = self.layers_ckpt
-        for layer in layers:
-            x = layer(x)
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         x = self.norm(x.to(self.norm.weight.dtype))
         return x
 
