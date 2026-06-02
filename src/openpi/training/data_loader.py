@@ -279,17 +279,10 @@ def create_behavior_data_loader_torch(
 
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    sampler = None
     if torch.distributed.is_initialized():
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset,
-            num_replicas=torch.distributed.get_world_size(),
-            rank=torch.distributed.get_rank(),
-            shuffle=shuffle,
-            drop_last=True,
-        )
+        # Only rank0 creates a dataloader; read full dataset at local_batch_size
+        # (each rank gets its own independent micro-batches).
         local_batch_size = config.batch_size // torch.distributed.get_world_size()
-        shuffle = True # do shuffle in sampler
     else:
         local_batch_size = config.batch_size
 
@@ -301,7 +294,7 @@ def create_behavior_data_loader_torch(
         num_workers=config.num_workers,
         seed=config.seed,
         framework="pytorch",
-        sampler=sampler,
+        sampler=None,
     )
 
     return DataLoaderImpl(data_config, data_loader)

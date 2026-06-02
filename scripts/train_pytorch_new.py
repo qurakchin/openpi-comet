@@ -412,13 +412,62 @@ def set_seed(seed: int, local_rank: int):
         torch.cuda.manual_seed_all(seed + local_rank)
 
 
-def build_datasets(config: _config.TrainConfig):
+def build_datasets(config: _config.TrainConfig, use_consistent):
     data_loader = _data_loader.create_behavior_data_loader_torch(
         config,
         skip_norm_stats=False,
-        shuffle=False,
+        shuffle=not use_consistent,
     )
     return data_loader
+
+
+def _send_batches_to_rank(batches, dst_rank: int):
+    """Send K batches to dst_rank via send_object_list."""
+    dist.send_object_list([batches], dst=dst_rank)
+
+
+def _recv_batches_from_rank(src_rank: int) -> list:
+    """Receive K batches from src_rank via recv_object_list."""
+    obj_list = [None]
+    dist.recv_object_list(obj_list, src=src_rank)
+    return obj_list[0]
+
+
+def _make_rngs_per_sample(global_step: int, config: _config.TrainConfig) -> list[torch.Generator]:
+    """Build per-sample CPU RNGs for one step."""
+    K = config.gradient_accumulate
+    W = dist.get_world_size() if dist.is_initialized() else 1
+    rank_id = dist.get_rank() if dist.is_initialized() else 0
+    lb = config.batch_size // W
+    rngs = []
+    for _s in range(K * lb):
+        _mi = _s // lb
+        _p = _s % lb
+        _logical_idx = (global_step * K * lb + _mi * lb + _p) * W + rank_id
+        _seed = (config.seed * 1000003 + int(_logical_idx)) & ((1 << 63) - 1)
+        rngs.append(torch.Generator(device="cpu").manual_seed(_seed))
+    return rngs
+
+
+def _make_noise_time(rngs: list[torch.Generator], micro_idx: int, config: _config.TrainConfig, dtype: torch.dtype, device: torch.device):
+    """Build per-sample noise and flow-matching time for one micro-batch."""
+    K = config.gradient_accumulate
+    W = dist.get_world_size() if dist.is_initialized() else 1
+    lb = config.batch_size // W
+    AH = config.model.action_horizon
+    AD = config.model.action_dim
+    B_local = config.batch_size // max(W, 1)
+    beta_conc = torch.tensor([1.5, 1.0])
+    noise_list, time_list = [], []
+    for _p in range(B_local):
+        g = rngs[micro_idx * lb + _p]
+        noise_list.append(torch.randn((AH, AD), generator=g))
+        t_dir = torch._sample_dirichlet(beta_conc, generator=g)
+        time_list.append(t_dir[0])
+    noise = torch.stack(noise_list, dim=0).to(dtype=dtype, device=device)
+    time = torch.stack(time_list, dim=0).to(dtype=dtype, device=device)
+    time = time * 0.999 + 0.001
+    return noise, time
 
 
 def train_step(
@@ -430,6 +479,7 @@ def train_step(
     global_step,
     batches,
     use_autocast,
+    use_consistent,
 ):
     def lr_schedule(step: int):
         warmup_steps = config.lr_schedule.warmup_steps
@@ -450,16 +500,23 @@ def train_step(
     for pg in optim.param_groups:
         pg["lr"] = lr_schedule(global_step)
 
+    if use_consistent:
+        rngs_per_sample = _make_rngs_per_sample(global_step, config)
+
     loss_acc = []
-    for batch in batches:
+    for micro_idx, batch in enumerate(batches):
         observation, actions = batch
         observation = _move_to_device(observation, device)
         actions = actions.to(device=device)
 
+        noise, time = None, None
+        if use_consistent:
+            noise, time = _make_noise_time(rngs_per_sample, micro_idx, config, actions.dtype, device)
+
         # Forward pass
         amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
         with amp_ctx:
-            losses = model(observation, actions, train=True)
+            losses = model(observation, actions, train=True, noise=noise, time=time)
         if not isinstance(losses, torch.Tensor):
             losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
@@ -734,6 +791,14 @@ def main(config: _config.TrainConfig):
             "use_autocast", False
         )
 
+    use_consistent = os.environ.get("USE_CONSISTENT", "")
+    if use_consistent != "":
+        use_consistent = bool(int(use_consistent))
+    else:
+        use_consistent = config.pytorch_dist_args.get(
+            "use_consistent", False
+        )
+
     if config.batch_size % torch.cuda.device_count() != 0:
         raise ValueError(
             f"Batch size {config.batch_size} must be divisible by the number of devices {torch.cuda.device_count()}."
@@ -795,9 +860,14 @@ def main(config: _config.TrainConfig):
             f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
         )
 
-    data_loader = build_datasets(config)
-    data_config = data_loader.data_config()
-    data_iter = iter(data_loader)
+    # Only rank 0 reads from dataloader; other ranks receive batches via
+    # broadcast_object_list at each step. data_config is sent at save time.
+    if is_main:
+        data_loader = build_datasets(config, use_consistent)
+        data_config = data_loader.data_config()
+        data_iter = iter(data_loader)
+    else:
+        data_config = None
 
     model, optim = init_model(
         config,
@@ -875,10 +945,20 @@ def main(config: _config.TrainConfig):
     t_start = time.perf_counter()
 
     for global_step in pbar:
-        if hasattr(data_loader, "set_epoch"):
+        if is_main and hasattr(data_loader, "set_epoch"):
             data_loader.set_epoch(global_step // len(data_loader))
 
-        batches = [next(data_iter) for _ in range(config.gradient_accumulate)]
+        # Rank 0 reads K micro-batches for each rank and sends them.
+        if is_main:
+            for r in range(1, world_size):
+                _send_batches_to_rank(
+                    [next(data_iter) for _ in range(config.gradient_accumulate)],
+                    dst_rank=r,
+                )
+            batches = [next(data_iter) for _ in range(config.gradient_accumulate)]
+        else:
+            batches = _recv_batches_from_rank(src_rank=0)
+
         info = train_step(
             config,
             dist_method,
@@ -888,6 +968,7 @@ def main(config: _config.TrainConfig):
             global_step,
             batches,
             use_autocast=use_autocast,
+            use_consistent=use_consistent,
         )
         infos.append(info)
 
