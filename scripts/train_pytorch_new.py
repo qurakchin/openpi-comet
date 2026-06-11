@@ -1,4 +1,5 @@
 import dataclasses
+import functools
 import gc
 import json
 import logging
@@ -22,6 +23,7 @@ from torch.distributed.fsdp import (
     FullOptimStateDictConfig,
     FullStateDictConfig,
     FullyShardedDataParallel as FSDP1,
+    MixedPrecision as FSDP1MP,
     ShardingStrategy,
     StateDictType,
 )
@@ -31,7 +33,7 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import (
     FSDPModule as FSDP2,
-    MixedPrecisionPolicy,
+    MixedPrecisionPolicy as FSDP2MP,
 )
 import tqdm
 import wandb
@@ -157,8 +159,11 @@ def apply_ddp(model, world_size, device):
     )
 
 
-def apply_fsdp1(model, device, mixed_precision, use_prefetch):
+def apply_fsdp1(model, device, mixed_precision, use_prefetch, auto_wrap_size=0):
     auto_wrap_policy = None
+    if auto_wrap_size != 0:
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+        auto_wrap_policy = functools.partial(size_based_auto_wrap_policy, min_num_params=auto_wrap_size)
     if use_prefetch:
         backward_prefetch = BackwardPrefetch.BACKWARD_PRE
         forward_prefetch = True
@@ -184,10 +189,15 @@ def apply_fsdp2(model, world_size: int, device, mp_policy, use_noreshard):
     if device.type != "cuda":
         raise RuntimeError("FSDP2 training requires CUDA.")
     if mp_policy is None:
-        mp_policy = MixedPrecisionPolicy()
+        mp_policy = FSDP2MP()
     mesh = init_device_mesh("cuda", (world_size,))
     reshard_after_forward = not use_noreshard
-    fully_shard(model, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=reshard_after_forward)
+    fully_shard(
+        model,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=reshard_after_forward,
+    )
     return model
 
 
@@ -276,6 +286,13 @@ def calc_param_std_dict(model, device):
 
     return std_dict
 
+def unwrap_model(model):
+    while True:
+        if isinstance(model, OptimizedModule):
+            model = model._orig_mod
+        else:
+            return model
+
 def init_model(
     config: _config.TrainConfig,
     dist_method,
@@ -293,14 +310,13 @@ def init_model(
             assert use_autocast == True
         elif dist_method == "fsdp1":
             if not use_autocast:
-                from torch.distributed.fsdp import MixedPrecision
-                mp_policy = MixedPrecision(
+                mp_policy = FSDP1MP(
                     param_dtype=torch.bfloat16,
                     reduce_dtype=torch.float32,
                 )
         elif dist_method == "fsdp2":
             if not use_autocast:
-                mp_policy = MixedPrecisionPolicy(
+                mp_policy = FSDP2MP(
                     param_dtype=torch.bfloat16,
                     reduce_dtype=torch.float32,
                     output_dtype=torch.bfloat16,
@@ -361,7 +377,8 @@ def init_model(
         model = apply_ddp(model, world_size, device)
     elif dist_method == "fsdp1":
         use_prefetch = bool(int(os.environ.get("USE_PREFETCH", "0")))
-        model = apply_fsdp1(model, device, mixed_precision=mp_policy, use_prefetch=use_prefetch)
+        auto_wrap_size = 10_000_000
+        model = apply_fsdp1(model, device, mp_policy, use_prefetch, auto_wrap_size)
         if is_main:
             logging.info(f"Enabled FSDP1 with FULL_SHARD and auto-wrap policy, use_prefetch={use_prefetch}")
     elif dist_method == "fsdp2":
@@ -450,7 +467,7 @@ def _make_rngs_per_sample(global_step: int, config: _config.TrainConfig) -> list
 
 
 def _make_noise_time(rngs: list[torch.Generator], micro_idx: int, config: _config.TrainConfig, dtype: torch.dtype, device: torch.device):
-    """Build per-sample noise and flow-matching time for one micro-batch."""
+    """Build per-sample noise and flow-matching time_ for one micro-batch."""
     K = config.gradient_accumulate
     W = dist.get_world_size() if dist.is_initialized() else 1
     lb = config.batch_size // W
@@ -465,9 +482,9 @@ def _make_noise_time(rngs: list[torch.Generator], micro_idx: int, config: _confi
         t_dir = torch._sample_dirichlet(beta_conc, generator=g)
         time_list.append(t_dir[0])
     noise = torch.stack(noise_list, dim=0).to(dtype=dtype, device=device)
-    time = torch.stack(time_list, dim=0).to(dtype=dtype, device=device)
-    time = time * 0.999 + 0.001
-    return noise, time
+    time_ = torch.stack(time_list, dim=0).to(dtype=dtype, device=device)
+    time_ = time_ * 0.999 + 0.001
+    return noise, time_
 
 
 def train_step(
@@ -509,14 +526,14 @@ def train_step(
         observation = _move_to_device(observation, device)
         actions = actions.to(device=device)
 
-        noise, time = None, None
+        noise, time_ = None, None
         if use_consistent:
-            noise, time = _make_noise_time(rngs_per_sample, micro_idx, config, actions.dtype, device)
+            noise, time_ = _make_noise_time(rngs_per_sample, micro_idx, config, actions.dtype, device)
 
         # Forward pass
         amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
         with amp_ctx:
-            losses = model(observation, actions, train=True, noise=noise, time=time)
+            losses = model(observation, actions, train=True, noise=noise, time_=time_)
         if not isinstance(losses, torch.Tensor):
             losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
@@ -651,7 +668,7 @@ def load_checkpoint(dist_method, model, optimizer, checkpoint_dir, device, is_ma
             loaded = True
     elif dist_method == "fsdp1":
         if safetensors_path.exists():
-            with FSDP.summon_full_params(model, writeback=True, rank0_only=False):
+            with FSDP1.summon_full_params(model, writeback=True, rank0_only=False):
                 safetensors.torch.load_model(get_base_model(dist_method, model), safetensors_path, device=str(device))
             loaded = True
     elif dist_method == "fsdp2":
@@ -780,8 +797,15 @@ def main(config: _config.TrainConfig):
     compile_mode = os.environ.get("TORCH_COMPILE_MODE", "")
     if compile_mode == "":
         compile_mode = config.pytorch_dist_args.get(
-            "torch_compile_mode", "default"
+            "torch_compile_mode", "null"
         )
+    assert compile_mode in [
+        "null",
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+   ]
 
     use_autocast = os.environ.get("USE_AUTOCAST", "")
     if use_autocast != "":
@@ -862,12 +886,11 @@ def main(config: _config.TrainConfig):
 
     # Only rank 0 reads from dataloader; other ranks receive batches via
     # broadcast_object_list at each step. data_config is sent at save time.
+    data_config = None
     if is_main:
         data_loader = build_datasets(config, use_consistent)
         data_config = data_loader.data_config()
         data_iter = iter(data_loader)
-    else:
-        data_config = None
 
     model, optim = init_model(
         config,
@@ -879,10 +902,9 @@ def main(config: _config.TrainConfig):
         use_autocast,
     )
     if dist_method == "fsdp1":
-        _m = model._orig_mod if isinstance(model, OptimizedModule) else model
-        assert isinstance(_m, FSDP1)
+        assert isinstance(unwrap_model(model), FSDP1)
     elif dist_method == "fsdp2":
-        assert isinstance(_m, FSDP2)
+        assert isinstance(unwrap_model(model), FSDP2)
 
     # Load checkpoint if resuming
     start_step = 0
@@ -892,29 +914,6 @@ def main(config: _config.TrainConfig):
             logging.info(f"Resumed training from step {start_step}")
 
     model.train()
-
-    # CUDA graph warmup:
-    # if compile_mode is not None:
-    #     WARMUP_STEPS = 3
-    #     if is_main:
-    #         logging.info(f"Running warmup ({WARMUP_STEPS} steps)...")
-    #     warmup_loader = debug_data_loader(effective_batch_size)
-    #     warmup_iter = itertools.cycle(warmup_loader)
-    #     warmup_amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_autocast else nullcontext()
-    #     for _ in range(WARMUP_STEPS):
-    #         observation, actions = next(warmup_iter)
-    #         observation = _move_to_device(observation, device)
-    #         actions = actions.to(device=device)
-    #         with warmup_amp_ctx:
-    #             losses = model(observation, actions, train=True)
-    #         if not isinstance(losses, torch.Tensor):
-    #             losses = torch.tensor(losses, device=device, dtype=torch.float32)
-    #         loss = losses.mean()
-    #         loss.backward()
-    #         optim.zero_grad(set_to_none=True)
-    #     del observation, actions, losses, loss
-    #     if is_main:
-    #         logging.info("CUDA graph warmup complete.")
 
     if is_main:
         log_memory_usage(device, 0, "after_model_init")
@@ -1006,27 +1005,6 @@ def main(config: _config.TrainConfig):
         wandb.finish()
 
     cleanup_distributed()
-
-def debug_data_loader(batch_size):
-    from openpi.models.model import Observation
-    import numpy as np
-    fake_rng = np.random.default_rng(42)
-    fake_batch_dict = {
-        'image': {},
-        'image_mask': {},
-        'state': fake_rng.normal(0, 1, (batch_size, 32)),
-        'tokenized_prompt': fake_rng.integers(0, 100, (batch_size, 200), dtype=np.int64),
-        'tokenized_prompt_mask': np.ones((batch_size, 200), dtype=np.bool_),
-        'actions': fake_rng.normal(0, 1, (batch_size, 32, 32)),
-    }
-    for k in ['base_0_rgb', 'left_wrist_0_rgb', 'right_wrist_0_rgb']:
-        fake_batch_dict['image'][k] = fake_rng.integers(0, 256, (batch_size, 224, 224, 3), dtype=np.uint8)
-        fake_batch_dict['image_mask'][k] = np.ones((batch_size,), dtype=np.bool_)
-
-    fake_batch_dict = jax.tree.map(torch.as_tensor, fake_batch_dict)
-    fake_obs = Observation.from_dict(fake_batch_dict)
-    fake_action = fake_batch_dict['actions']
-    return [(fake_obs, fake_action)]
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from openpi.models_pytorch_new.utils import _str_to_dtype
+from openpi.models_pytorch_new.utils import _str_to_dtype, checkpointing
 
 
 def posemb_sincos_2d(h: int, w: int, width: int, temperature: float = 10000.0) -> torch.Tensor:
@@ -97,9 +97,8 @@ class Encoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
-            else:
-                x = layer(x)
+                layer = checkpointing(layer, use_reentrant=False)
+            x = layer(x)
         x = self.norm(x.to(self.norm.weight.dtype))
         return x
 

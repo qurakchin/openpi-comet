@@ -210,15 +210,18 @@ class Pi0(_model.BaseModel):
 
     @override
     def compute_loss(
-        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False,
+        noise=None, time_=None,
     ) -> at.Float[at.Array, "*b ah"]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
         batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
-        time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
-        time_expanded = time[..., None, None]
+        if noise is None:
+            noise = jax.random.normal(noise_rng, actions.shape)
+        if time_ is None:
+            time_ = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        time_expanded = time_[..., None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 

@@ -22,7 +22,7 @@ import torch.utils.checkpoint
 
 from openpi.models_pytorch_new import lora
 from openpi.models_pytorch_new.lora import FeedForward as LoRAFeedForward
-from openpi.models_pytorch_new.utils import _str_to_dtype
+from openpi.models_pytorch_new.utils import _str_to_dtype, checkpointing
 
 PALIGEMMA_VOCAB_SIZE = 257_152
 
@@ -532,17 +532,8 @@ class Module(nn.Module):
         for i, layer in enumerate(self.layers):
             layer_kv = layer_kv_caches[i] if i < len(layer_kv_caches) else None
             if self.gradient_checkpointing and self.training:
-                xs, new_kv = torch.utils.checkpoint.checkpoint(
-                    layer,
-                    xs,
-                    layer_kv,
-                    positions,
-                    mask,
-                    adarms_cond,
-                    use_reentrant=False,
-                )
-            else:
-                xs, new_kv = layer(xs, layer_kv, positions, mask, adarms_cond)
+                layer = checkpointing(layer, use_reentrant=False)
+            xs, new_kv = layer(xs, layer_kv, positions, mask, adarms_cond)
             new_layer_kv_caches.append(new_kv)
 
         # Return the list of per-layer KV caches

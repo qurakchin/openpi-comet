@@ -201,7 +201,7 @@ class Pi0(model.BaseModel):
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Embed the suffix (state + noisy actions + time embedding).
+        """Embed the suffix (state + noisy actions + time_ embedding).
 
         Args:
             obs: observation
@@ -282,7 +282,7 @@ class Pi0(model.BaseModel):
         train: bool = False,
         rng: torch.Generator | None = None,
         noise: torch.Tensor | None = None,
-        time: torch.Tensor | None = None,
+        time_: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute flow matching loss.
 
@@ -301,21 +301,21 @@ class Pi0(model.BaseModel):
         actions = actions.to(dtype=embed_dtype)
         dtype = actions.dtype
 
-        # Sample noise and time (or use provided values for reproducibility)
+        # Sample noise and time_ (or use provided values for reproducibility)
         if noise is None:
             noise = torch.randn(actions.shape, device=device, dtype=dtype, generator=rng)
         else:
             noise = noise.to(dtype=dtype)
-        if time is None:
-            time = (
+        if time_ is None:
+            time_ = (
                 torch.distributions.Beta(torch.tensor(1.5), torch.tensor(1.0))
                 .sample((B,))
                 .to(device=device, dtype=dtype)
             )
-            time = time * 0.999 + 0.001
+            time_ = time_ * 0.999 + 0.001
         else:
-            time = time.to(dtype=dtype)
-        time_expanded = time[:, None, None]
+            time_ = time_.to(dtype=dtype)
+        time_expanded = time_[:, None, None]
 
         # Flow matching interpolation
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -323,7 +323,7 @@ class Pi0(model.BaseModel):
 
         # One forward pass for prefix + suffix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time_)
 
         input_mask = torch.cat([prefix_mask, suffix_mask], dim=1)
         ar_mask = torch.cat([prefix_ar_mask, suffix_ar_mask], dim=0)
@@ -419,10 +419,10 @@ class Pi0(model.BaseModel):
         train: bool = True,
         rng: torch.Generator | None = None,
         noise: torch.Tensor | None = None,
-        time: torch.Tensor | None = None,
+        time_: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Default forward computes loss."""
-        return self.compute_loss(observation, actions, train=train, rng=rng, noise=noise, time=time)
+        return self.compute_loss(observation, actions, train=train, rng=rng, noise=noise, time_=time_)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency."""
